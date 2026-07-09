@@ -647,6 +647,31 @@ where
         let candidate_indices_gpu =
             GpuTensor::<R, u32>::empty(vec![n_queries, max_candidates], client);
 
+        // Sentinel-fill the candidate buffers before the mega kernel runs.
+        // The mega kernel writes sparsely into these tensors at per-task
+        // offsets; on lavapipe/Vulkan, isolated writes can still be dropped
+        // by the shader compiler even with the workaround in
+        // `compute_ivf_mega_*_cached`. Any unwritten slot then feeds
+        // uninitialised VRAM to the reducer, which returns garbage `u32`
+        // indices in the ~1e9 range and blows up `original_indices[reorg_idx]`
+        // downstream. Filling dists to `f32::MAX` first makes the reducer's
+        // `d < f32::MAX` guard reject any untouched slot.
+        let init_gx = (max_candidates as u32)
+            .div_ceil(WORKGROUP_SIZE_X)
+            .max(1);
+        let (init_gy, init_gz) =
+            grid_2d((n_queries as u32).div_ceil(safe_worksize_y));
+        unsafe {
+            init_topk::launch_unchecked::<T, R>(
+                client,
+                CubeCount::Static(init_gx, init_gy, init_gz),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
+                candidate_dists_gpu.clone().into_tensor_arg(),
+                candidate_indices_gpu.clone().into_tensor_arg(),
+                safe_worksize_y,
+            );
+        }
+
         let task_q_idx_gpu = GpuTensor::<R, u32>::from_slice(&task_q_idx, vec![n_tasks], client);
         let task_db_start_gpu =
             GpuTensor::<R, u32>::from_slice(&task_db_start, vec![n_tasks], client);

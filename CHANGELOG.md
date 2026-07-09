@@ -1,5 +1,11 @@
 # News
 
+## 0.4.5
+
+**Fixes**
+
+- Add sentinel values to deal with Lavapipe quirks in the IVF GPU kernel.
+
 ## 0.4.4
 
 **Features**

@@ -683,9 +683,17 @@ where
         let mega_grid_x = max_db_count.div_ceil(WORKGROUP_SIZE_X).max(1);
         let (mega_grid_y, mega_grid_z) = grid_2d((n_tasks as u32).div_ceil(safe_worksize_y));
 
+        // Use the non-cached mega kernels. The shared-memory task-metadata
+        // caching in the `_cached` variants trips a cubecl 0.10 miscompile
+        // on lavapipe that the existing if/else workaround only partially
+        // covers — the mega kernel still writes garbage `real_db_idx` values
+        // that survive sentinel-initialised candidate buffers. Reading the
+        // four u32 task fields directly from global memory per thread costs
+        // ~4 extra reads per workgroup and sidesteps the whole class of
+        // shared-memory bugs.
         match self.metric {
             Dist::SquaredEuclidean => unsafe {
-                compute_ivf_mega_euclidean_cached::launch_unchecked::<T, R>(
+                compute_ivf_mega_euclidean::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
@@ -698,13 +706,11 @@ where
                     task_db_count_gpu.into_tensor_arg(),
                     candidate_dists_gpu.clone().into_tensor_arg(),
                     candidate_indices_gpu.clone().into_tensor_arg(),
-                    n_tasks as u32,
-                    dim_lines,
                     safe_worksize_y,
                 );
             },
             Dist::Cosine => unsafe {
-                compute_ivf_mega_cosine_cached::launch_unchecked::<T, R>(
+                compute_ivf_mega_cosine::launch_unchecked::<T, R>(
                     client,
                     CubeCount::Static(mega_grid_x, mega_grid_y, mega_grid_z),
                     CubeDim::new_2d(WORKGROUP_SIZE_X, safe_worksize_y),
@@ -719,8 +725,6 @@ where
                     task_db_count_gpu.into_tensor_arg(),
                     candidate_dists_gpu.clone().into_tensor_arg(),
                     candidate_indices_gpu.clone().into_tensor_arg(),
-                    n_tasks as u32,
-                    dim_lines,
                     safe_worksize_y,
                 );
             },

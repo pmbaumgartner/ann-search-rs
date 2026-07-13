@@ -87,6 +87,83 @@ fn sq8_weighted_l2_neon(a: &[i8], b: &[i8], weights: &[f32]) -> f32 {
     }
 }
 
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn sq8_weighted_l2_sse41(a: &[i8], b: &[i8], weights: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut offset = 0;
+    let mut acc = _mm_setzero_ps();
+    while offset + 16 <= a.len() {
+        let va = _mm_loadu_si128(a.as_ptr().add(offset).cast());
+        let vb = _mm_loadu_si128(b.as_ptr().add(offset).cast());
+
+        let diff0 = _mm_cvtepi32_ps(_mm_sub_epi32(_mm_cvtepi8_epi32(va), _mm_cvtepi8_epi32(vb)));
+        let diff4 = _mm_cvtepi32_ps(_mm_sub_epi32(
+            _mm_cvtepi8_epi32(_mm_srli_si128::<4>(va)),
+            _mm_cvtepi8_epi32(_mm_srli_si128::<4>(vb)),
+        ));
+        let diff8 = _mm_cvtepi32_ps(_mm_sub_epi32(
+            _mm_cvtepi8_epi32(_mm_srli_si128::<8>(va)),
+            _mm_cvtepi8_epi32(_mm_srli_si128::<8>(vb)),
+        ));
+        let diff12 = _mm_cvtepi32_ps(_mm_sub_epi32(
+            _mm_cvtepi8_epi32(_mm_srli_si128::<12>(va)),
+            _mm_cvtepi8_epi32(_mm_srli_si128::<12>(vb)),
+        ));
+
+        for (lane, diff) in [diff0, diff4, diff8, diff12].into_iter().enumerate() {
+            let weight = _mm_loadu_ps(weights.as_ptr().add(offset + lane * 4));
+            acc = _mm_add_ps(acc, _mm_mul_ps(_mm_mul_ps(diff, diff), weight));
+        }
+        offset += 16;
+    }
+
+    let mut lanes = [0.0_f32; 4];
+    _mm_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.into_iter().sum::<f32>();
+    for idx in offset..a.len() {
+        let diff = a[idx] as f32 - b[idx] as f32;
+        sum += diff * diff * weights[idx];
+    }
+    sum
+}
+
+#[cfg(all(feature = "quantised", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sq8_weighted_l2_avx2(a: &[i8], b: &[i8], weights: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut offset = 0;
+    let mut acc = _mm256_setzero_ps();
+    while offset + 16 <= a.len() {
+        let va = _mm_loadu_si128(a.as_ptr().add(offset).cast());
+        let vb = _mm_loadu_si128(b.as_ptr().add(offset).cast());
+        let diff_lo = _mm256_cvtepi32_ps(_mm256_sub_epi32(
+            _mm256_cvtepi8_epi32(va),
+            _mm256_cvtepi8_epi32(vb),
+        ));
+        let diff_hi = _mm256_cvtepi32_ps(_mm256_sub_epi32(
+            _mm256_cvtepi8_epi32(_mm_srli_si128::<8>(va)),
+            _mm256_cvtepi8_epi32(_mm_srli_si128::<8>(vb)),
+        ));
+        let weight_lo = _mm256_loadu_ps(weights.as_ptr().add(offset));
+        let weight_hi = _mm256_loadu_ps(weights.as_ptr().add(offset + 8));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(diff_lo, diff_lo), weight_lo, acc);
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(diff_hi, diff_hi), weight_hi, acc);
+        offset += 16;
+    }
+
+    let mut lanes = [0.0_f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.into_iter().sum::<f32>();
+    for idx in offset..a.len() {
+        let diff = a[idx] as f32 - b[idx] as f32;
+        sum += diff * diff * weights[idx];
+    }
+    sum
+}
+
 #[cfg(feature = "quantised")]
 #[inline(always)]
 fn sq8_weighted_l2(a: &[i8], b: &[i8], weights: &[f32]) -> f32 {
@@ -96,7 +173,17 @@ fn sq8_weighted_l2(a: &[i8], b: &[i8], weights: &[f32]) -> f32 {
     {
         return sq8_weighted_l2_neon(a, b, weights);
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return unsafe { sq8_weighted_l2_avx2(a, b, weights) };
+        }
+        if std::is_x86_feature_detected!("sse4.1") {
+            return unsafe { sq8_weighted_l2_sse41(a, b, weights) };
+        }
+        return sq8_weighted_l2_scalar(a, b, weights);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         sq8_weighted_l2_scalar(a, b, weights)
     }

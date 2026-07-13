@@ -596,6 +596,18 @@ where
     HnswIndex::build(mat, m, ef_construction, &metric, seed, verbose)
 }
 
+#[cfg(feature = "quantised")]
+/// Build a squared-Euclidean HNSW index backed by weighted per-dimension SQ8 codes.
+pub fn build_hnsw_sq8_index(
+    mat: MatRef<f32>,
+    m: usize,
+    ef_construction: usize,
+    seed: usize,
+    verbose: bool,
+) -> HnswIndex<f32> {
+    HnswIndex::build_sq8(mat, m, ef_construction, seed, verbose)
+}
+
 /// Helper function to query a given HNSW index
 ///
 /// ### Params

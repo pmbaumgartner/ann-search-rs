@@ -13,6 +13,95 @@ use crate::prelude::*;
 use crate::utils::graph_utils::*;
 use crate::utils::*;
 
+#[cfg(feature = "quantised")]
+/// Calibration and encoding diagnostics retained by an SQ8 HNSW index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HnswSq8Stats {
+    /// Wall time spent deriving per-dimension scales and encoding the data.
+    pub quantization_seconds: f64,
+    /// Number of retained codes at either symmetric endpoint (`-127` or `127`).
+    pub endpoint_codes: usize,
+    /// Number of build values clipped outside the fitted calibration range.
+    pub clipped_values: usize,
+}
+
+enum HnswVectorStorage {
+    Float,
+    #[cfg(feature = "quantised")]
+    Sq8 {
+        codes: Vec<i8>,
+        weights: Vec<f32>,
+        stats: HnswSq8Stats,
+    },
+}
+
+#[cfg(feature = "quantised")]
+#[allow(dead_code)]
+#[inline(always)]
+fn sq8_weighted_l2_scalar(a: &[i8], b: &[i8], weights: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .zip(weights)
+        .map(|((&x, &y), &weight)| {
+            let diff = x as f32 - y as f32;
+            diff * diff * weight
+        })
+        .sum()
+}
+
+#[cfg(all(feature = "quantised", target_arch = "aarch64"))]
+#[inline(always)]
+fn sq8_weighted_l2_neon(a: &[i8], b: &[i8], weights: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let chunks = a.len() / 16;
+    let mut offset = 0;
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        for _ in 0..chunks {
+            let va = vld1q_s8(a.as_ptr().add(offset));
+            let vb = vld1q_s8(b.as_ptr().add(offset));
+            // Widen before subtraction and multiplication: an i8 difference is
+            // at most 254, and 254^2 fits exactly in the resulting i32 lanes.
+            let dlo = vsubq_s16(vmovl_s8(vget_low_s8(va)), vmovl_s8(vget_low_s8(vb)));
+            let dhi = vsubq_s16(vmovl_high_s8(va), vmovl_high_s8(vb));
+            let squares = [
+                vmull_s16(vget_low_s16(dlo), vget_low_s16(dlo)),
+                vmull_high_s16(dlo, dlo),
+                vmull_s16(vget_low_s16(dhi), vget_low_s16(dhi)),
+                vmull_high_s16(dhi, dhi),
+            ];
+            for (lane, square) in squares.into_iter().enumerate() {
+                let weight = vld1q_f32(weights.as_ptr().add(offset + lane * 4));
+                acc = vfmaq_f32(acc, vcvtq_f32_s32(square), weight);
+            }
+            offset += 16;
+        }
+
+        let mut sum = vaddvq_f32(acc);
+        for idx in offset..a.len() {
+            let diff = a[idx] as f32 - b[idx] as f32;
+            sum += diff * diff * weights[idx];
+        }
+        sum
+    }
+}
+
+#[cfg(feature = "quantised")]
+#[inline(always)]
+fn sq8_weighted_l2(a: &[i8], b: &[i8], weights: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), weights.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        return sq8_weighted_l2_neon(a, b, weights);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sq8_weighted_l2_scalar(a, b, weights)
+    }
+}
+
 /////////////
 // Helpers //
 /////////////
@@ -532,6 +621,8 @@ where
     pub n: usize,
     /// Pre-computed norms for Cosine distance (empty for Euclidean)
     pub norms: Vec<T>,
+    /// Retained vector representation used by graph construction and search.
+    storage: HnswVectorStorage,
     /// Distance metric (Euclidean or Cosine)
     metric: Dist,
     /// Maximum layer each node appears in
@@ -572,6 +663,31 @@ where
 
     fn norms(&self) -> &[T] {
         &self.norms
+    }
+
+    #[inline(always)]
+    fn euclidean_distance(&self, i: usize, j: usize) -> T {
+        match &self.storage {
+            HnswVectorStorage::Float => {
+                let start_i = i * self.dim;
+                let start_j = j * self.dim;
+                T::euclidean_simd(
+                    &self.vectors_flat[start_i..start_i + self.dim],
+                    &self.vectors_flat[start_j..start_j + self.dim],
+                )
+            }
+            #[cfg(feature = "quantised")]
+            HnswVectorStorage::Sq8 { codes, weights, .. } => {
+                let start_i = i * self.dim;
+                let start_j = j * self.dim;
+                T::from_f32(sq8_weighted_l2(
+                    &codes[start_i..start_i + self.dim],
+                    &codes[start_j..start_j + self.dim],
+                    weights,
+                ))
+                .unwrap()
+            }
+        }
     }
 }
 
@@ -628,7 +744,45 @@ where
         seed: usize,
         verbose: bool,
     ) -> Self {
+        Self::build_impl(data, m, ef_construction, metric, seed, verbose, false)
+    }
+
+    #[cfg(feature = "quantised")]
+    /// Build a squared-Euclidean HNSW index over weighted per-dimension SQ8 codes.
+    ///
+    /// The index retains only codes and scale-squared weights. External float
+    /// queries are encoded with the fitted calibration before graph traversal.
+    pub fn build_sq8(
+        data: MatRef<T>,
+        m: usize,
+        ef_construction: usize,
+        seed: usize,
+        verbose: bool,
+    ) -> Self {
+        Self::build_impl(
+            data,
+            m,
+            ef_construction,
+            &Dist::SquaredEuclidean,
+            seed,
+            verbose,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_impl(
+        data: MatRef<T>,
+        m: usize,
+        ef_construction: usize,
+        metric: &Dist,
+        seed: usize,
+        verbose: bool,
+        sq8: bool,
+    ) -> Self {
         let (vectors_flat, n, dim) = matrix_to_flat(data);
+        #[cfg(feature = "quantised")]
+        let mut vectors_flat = vectors_flat;
 
         if verbose {
             println!(
@@ -651,6 +805,62 @@ where
                 .collect()
         } else {
             Vec::new()
+        };
+
+        #[cfg(feature = "quantised")]
+        let storage = if sq8 {
+            let quantization_start = Instant::now();
+            let scales: Vec<f32> = (0..dim)
+                .into_par_iter()
+                .map(|d| {
+                    let max_abs = vectors_flat
+                        .chunks_exact(dim)
+                        .map(|row| row[d].abs().to_f32().unwrap())
+                        .fold(0.0_f32, f32::max);
+                    if max_abs > 0.0 {
+                        max_abs / 127.0
+                    } else {
+                        1.0
+                    }
+                })
+                .collect();
+
+            let mut codes = vec![0_i8; n * dim];
+            codes
+                .par_chunks_mut(dim)
+                .enumerate()
+                .for_each(|(row, output)| {
+                    for d in 0..dim {
+                        output[d] = (vectors_flat[row * dim + d].to_f32().unwrap() / scales[d])
+                            .round()
+                            .clamp(-127.0, 127.0) as i8;
+                    }
+                });
+            let endpoint_codes = codes
+                .par_iter()
+                .filter(|&&code| code == -127 || code == 127)
+                .count();
+            let weights = scales.into_iter().map(|scale| scale * scale).collect();
+            let stats = HnswSq8Stats {
+                quantization_seconds: quantization_start.elapsed().as_secs_f64(),
+                endpoint_codes,
+                clipped_values: 0,
+            };
+            vectors_flat.clear();
+            vectors_flat.shrink_to_fit();
+            HnswVectorStorage::Sq8 {
+                codes,
+                weights,
+                stats,
+            }
+        } else {
+            HnswVectorStorage::Float
+        };
+
+        #[cfg(not(feature = "quantised"))]
+        let storage = {
+            debug_assert!(!sq8);
+            HnswVectorStorage::Float
         };
 
         // Assign layers using exponential distribution
@@ -689,6 +899,7 @@ where
             n,
             metric: *metric,
             norms,
+            storage,
             layer_assignments: layer_assignments.clone(),
             neighbours_flat: Vec::new(),
             neighbour_offsets: Vec::new(),
@@ -701,7 +912,30 @@ where
         };
 
         // Build the graph layer by layer, from TOP to BOTTOM
-        index.build_graph(&construction_graph, verbose);
+        match &index.storage {
+            HnswVectorStorage::Float => {
+                let distance = |a: usize, b: usize| match index.metric {
+                    Dist::SquaredEuclidean => index.euclidean_distance(a, b),
+                    Dist::Cosine => index.cosine_distance(a, b),
+                    Dist::Manhattan => index.manhattan_distance(a, b),
+                };
+                index.build_graph(&construction_graph, verbose, &distance);
+            }
+            #[cfg(feature = "quantised")]
+            HnswVectorStorage::Sq8 { codes, weights, .. } => {
+                let distance = |a: usize, b: usize| {
+                    let start_a = a * index.dim;
+                    let start_b = b * index.dim;
+                    T::from_f32(sq8_weighted_l2(
+                        &codes[start_a..start_a + index.dim],
+                        &codes[start_b..start_b + index.dim],
+                        weights,
+                    ))
+                    .unwrap()
+                };
+                index.build_graph(&construction_graph, verbose, &distance);
+            }
+        }
 
         // Convert construction graph to flat layout
         let (neighbours_flat, neighbour_offsets, _) = construction_graph.into_flat();
@@ -724,7 +958,10 @@ where
     ///
     /// * `graph` - Construction graph to populate
     /// * `verbose` - Whether to print progress
-    fn build_graph(&self, graph: &ConstructionGraph<T>, verbose: bool) {
+    fn build_graph<F>(&self, graph: &ConstructionGraph<T>, verbose: bool, distance: &F)
+    where
+        F: Fn(usize, usize) -> T + Sync,
+    {
         // Sort nodes: highest layer first, then by node id for determinism
         // within a layer.
         let mut insertion_order: Vec<usize> = (0..self.n).collect();
@@ -765,7 +1002,7 @@ where
         for &node in &upper_nodes {
             Self::with_build_state(|state_cell| {
                 let mut state = state_cell.borrow_mut();
-                self.insert_node(node, graph, &mut state);
+                self.insert_node(node, graph, &mut state, distance);
             });
         }
 
@@ -786,7 +1023,7 @@ where
         base_only_nodes.par_iter().for_each(|&node| {
             Self::with_build_state(|state_cell| {
                 let mut state = state_cell.borrow_mut();
-                self.insert_node(node, graph, &mut state);
+                self.insert_node(node, graph, &mut state, distance);
             });
         });
 
@@ -801,16 +1038,20 @@ where
     /// Performs greedy descent from the entry point through upper layers,
     /// then does ef_construction search and connects the node at each
     /// layer it belongs to, from its highest layer down to layer 0.
-    fn insert_node(&self, node: usize, graph: &ConstructionGraph<T>, state: &mut SearchState<T>) {
+    fn insert_node<F>(
+        &self,
+        node: usize,
+        graph: &ConstructionGraph<T>,
+        state: &mut SearchState<T>,
+        distance: &F,
+    ) where
+        F: Fn(usize, usize) -> T + Sync,
+    {
         let node_level = self.layer_assignments[node];
         let mut current_node = self.entry_point as usize;
 
         // greedy descent through layers above this node's highest layer
-        let mut current_dist = OrderedFloat(match self.metric {
-            Dist::SquaredEuclidean => self.euclidean_distance(node, current_node),
-            Dist::Cosine => self.cosine_distance(node, current_node),
-            Dist::Manhattan => self.manhattan_distance(node, current_node),
-        });
+        let mut current_dist = OrderedFloat(distance(node, current_node));
 
         for layer in (node_level + 1..=self.max_layer).rev() {
             let mut changed = true;
@@ -829,11 +1070,7 @@ where
                     }
                     let neighbour = neighbour as usize;
 
-                    let dist = OrderedFloat(match self.metric {
-                        Dist::SquaredEuclidean => self.euclidean_distance(node, neighbour),
-                        Dist::Cosine => self.cosine_distance(node, neighbour),
-                        Dist::Manhattan => self.manhattan_distance(node, neighbour),
-                    });
+                    let dist = OrderedFloat(distance(node, neighbour));
 
                     if dist < current_dist {
                         current_node = neighbour;
@@ -845,14 +1082,6 @@ where
         }
 
         // for each layer this node belongs to (top-down), search and connect
-        let distance_fn = |a: usize, b: usize| -> T {
-            match self.metric {
-                Dist::SquaredEuclidean => self.euclidean_distance(a, b),
-                Dist::Cosine => self.cosine_distance(a, b),
-                Dist::Manhattan => self.manhattan_distance(a, b),
-            }
-        };
-
         for layer in (0..=node_level).rev() {
             state.reset(self.n);
 
@@ -863,10 +1092,12 @@ where
                 self.ef_construction,
                 graph,
                 state,
+                distance,
             );
 
             let candidates: Vec<(OrderedFloat<T>, usize)> = state.working_sorted.data().to_vec();
-            let selected = self.select_neighbours_heuristic(node, &candidates, layer, state);
+            let selected =
+                self.select_neighbours_heuristic(node, &candidates, layer, state, distance);
 
             // set this node's outgoing neighbours
             graph.set_neighbours(node, layer, &selected);
@@ -874,7 +1105,7 @@ where
             // update reverse links: add this node to each neighbour's list
             for &(_, neighbour_id) in &selected {
                 if neighbour_id != node && graph.node_level(neighbour_id) >= layer {
-                    graph.add_neighbour_with_pruning(neighbour_id, layer, node, &distance_fn);
+                    graph.add_neighbour_with_pruning(neighbour_id, layer, node, distance);
                 }
             }
 
@@ -971,7 +1202,7 @@ where
     /// ### Returns
     ///
     /// Vector of (distance, id) pairs for closest candidates
-    fn search_layer_construction(
+    fn search_layer_construction<F>(
         &self,
         query_node: usize,
         target_layer: u8,
@@ -979,15 +1210,14 @@ where
         ef: usize,
         graph: &ConstructionGraph<T>,
         state: &mut SearchState<T>,
-    ) {
+        distance: &F,
+    ) where
+        F: Fn(usize, usize) -> T + Sync,
+    {
         state.working_sorted.clear();
         state.candidates.clear();
 
-        let entry_dist = OrderedFloat(match self.metric {
-            Dist::SquaredEuclidean => self.euclidean_distance(query_node, entry_node),
-            Dist::Cosine => self.cosine_distance(query_node, entry_node),
-            Dist::Manhattan => self.manhattan_distance(query_node, entry_node),
-        });
+        let entry_dist = OrderedFloat(distance(query_node, entry_node));
 
         state.mark_visited(entry_node);
         state.candidates.push(Reverse((entry_dist, entry_node)));
@@ -1015,11 +1245,7 @@ where
                 }
                 state.mark_visited(neighbour_id);
 
-                let dist = OrderedFloat(match self.metric {
-                    Dist::SquaredEuclidean => self.euclidean_distance(query_node, neighbour_id),
-                    Dist::Cosine => self.cosine_distance(query_node, neighbour_id),
-                    Dist::Manhattan => self.manhattan_distance(query_node, neighbour_id),
-                });
+                let dist = OrderedFloat(distance(query_node, neighbour_id));
 
                 if dist < furthest_dist || state.working_sorted.len() < ef {
                     state.candidates.push(Reverse((dist, neighbour_id)));
@@ -1054,13 +1280,17 @@ where
     /// ### Returns
     ///
     /// Pruned neighbour list respecting max_neighbours constraint
-    fn select_neighbours_heuristic(
+    fn select_neighbours_heuristic<F>(
         &self,
         node: usize,
         candidates: &[(OrderedFloat<T>, usize)],
         layer: u8,
         state: &mut SearchState<T>,
-    ) -> Vec<(OrderedFloat<T>, usize)> {
+        distance: &F,
+    ) -> Vec<(OrderedFloat<T>, usize)>
+    where
+        F: Fn(usize, usize) -> T + Sync,
+    {
         let max_neighbours = if layer == 0 { self.m * 2 } else { self.m };
 
         state.scratch_working.clear();
@@ -1081,11 +1311,7 @@ where
             }
 
             let is_good = !result.iter().any(|&(_, selected_id)| {
-                let dist_to_selected = OrderedFloat(match self.metric {
-                    Dist::SquaredEuclidean => self.euclidean_distance(cand_id, selected_id),
-                    Dist::Cosine => self.cosine_distance(cand_id, selected_id),
-                    Dist::Manhattan => self.manhattan_distance(cand_id, selected_id),
-                });
+                let dist_to_selected = OrderedFloat(distance(cand_id, selected_id));
                 dist_to_selected < cand_dist
             });
 
@@ -1125,39 +1351,62 @@ where
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.check_dim(query.len())?;
 
+        match &self.storage {
+            HnswVectorStorage::Float => {
+                let query_norm = if self.metric == Dist::Cosine {
+                    query
+                        .iter()
+                        .map(|x| *x * *x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt()
+                } else {
+                    T::one()
+                };
+                let distance =
+                    |idx: usize| self.compute_float_query_distance(query, idx, query_norm);
+                self.query_with_distance(k, ef_search, &distance)
+            }
+            #[cfg(feature = "quantised")]
+            HnswVectorStorage::Sq8 { weights, .. } => {
+                let encoded: Vec<i8> = query
+                    .iter()
+                    .zip(weights)
+                    .map(|(&value, &weight)| {
+                        (value.to_f32().unwrap() / weight.sqrt())
+                            .round()
+                            .clamp(-127.0, 127.0) as i8
+                    })
+                    .collect();
+                self.query_sq8_codes(&encoded, k, ef_search)
+            }
+        }
+    }
+
+    fn query_with_distance<F>(
+        &self,
+        k: usize,
+        ef_search: usize,
+        distance: &F,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors>
+    where
+        F: Fn(usize) -> T,
+    {
         Self::with_search_state(|state_cell| {
             let mut state = state_cell.borrow_mut();
             state.reset(self.n);
-
-            let query_norm = if self.metric == Dist::Cosine {
-                query
-                    .iter()
-                    .map(|x| *x * *x)
-                    .fold(T::zero(), |a, b| a + b)
-                    .sqrt()
-            } else {
-                T::one()
-            };
 
             // start from entry point, descend through upper layers
             let mut current_node = self.entry_point as usize;
 
             // greedy search through upper layers (max_layer down to 1)
             for layer in (1..=self.max_layer).rev() {
-                current_node =
-                    self.greedy_search_layer_query(query, query_norm, current_node, layer);
+                current_node = self.greedy_search_layer_query(current_node, layer, distance);
             }
 
             // full search at base layer
             state.reset(self.n);
-            let mut candidates = self.search_layer_query(
-                query,
-                query_norm,
-                0,
-                current_node,
-                ef_search.max(k),
-                &mut state,
-            );
+            let mut candidates =
+                self.search_layer_query(0, current_node, ef_search.max(k), &mut state, distance);
 
             candidates.truncate(k);
 
@@ -1185,15 +1434,12 @@ where
     /// ### Returns
     ///
     /// Index of closest node found at this layer
-    fn greedy_search_layer_query(
-        &self,
-        query: &[T],
-        query_norm: T,
-        start_node: usize,
-        layer: u8,
-    ) -> usize {
+    fn greedy_search_layer_query<F>(&self, start_node: usize, layer: u8, distance: &F) -> usize
+    where
+        F: Fn(usize) -> T,
+    {
         let mut current = start_node;
-        let mut current_dist = self.compute_query_distance(query, current, query_norm);
+        let mut current_dist = distance(current);
 
         loop {
             let mut changed = false;
@@ -1211,7 +1457,7 @@ where
                     continue;
                 }
 
-                let dist = self.compute_query_distance(query, neighbour, query_norm);
+                let dist = distance(neighbour);
 
                 if dist < current_dist {
                     current = neighbour;
@@ -1245,19 +1491,21 @@ where
     /// ### Returns
     ///
     /// Vector of (distance, id) pairs for closest candidates
-    fn search_layer_query(
+    fn search_layer_query<F>(
         &self,
-        query: &[T],
-        query_norm: T,
         layer: u8,
         entry_node: usize,
         ef: usize,
         state: &mut SearchState<T>,
-    ) -> Vec<(OrderedFloat<T>, usize)> {
+        distance: &F,
+    ) -> Vec<(OrderedFloat<T>, usize)>
+    where
+        F: Fn(usize) -> T,
+    {
         state.working_sorted.clear();
         state.candidates.clear();
 
-        let entry_dist = OrderedFloat(self.compute_query_distance(query, entry_node, query_norm));
+        let entry_dist = OrderedFloat(distance(entry_node));
 
         state.mark_visited(entry_node);
         state.candidates.push(Reverse((entry_dist, entry_node)));
@@ -1287,8 +1535,7 @@ where
                 }
                 state.mark_visited(neighbour_id);
 
-                let dist =
-                    OrderedFloat(self.compute_query_distance(query, neighbour_id, query_norm));
+                let dist = OrderedFloat(distance(neighbour_id));
 
                 if dist < furthest_dist || state.working_sorted.len() < ef {
                     state.candidates.push(Reverse((dist, neighbour_id)));
@@ -1307,6 +1554,29 @@ where
         }
 
         state.working_sorted.data().to_vec()
+    }
+
+    #[cfg(feature = "quantised")]
+    fn query_sq8_codes(
+        &self,
+        query: &[i8],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        let HnswVectorStorage::Sq8 { codes, weights, .. } = &self.storage else {
+            unreachable!("SQ8 query used with float HNSW storage")
+        };
+        debug_assert_eq!(query.len(), self.dim);
+        let distance = |idx: usize| {
+            let start = idx * self.dim;
+            T::from_f32(sq8_weighted_l2(
+                query,
+                &codes[start..start + self.dim],
+                weights,
+            ))
+            .unwrap()
+        };
+        self.query_with_distance(k, ef_search, &distance)
     }
 
     /// Query using a matrix row reference
@@ -1375,7 +1645,6 @@ where
             .map(|i| {
                 let start = i * self.dim;
                 let end = start + self.dim;
-                let vec = &self.vectors_flat[start..end];
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1388,7 +1657,15 @@ where
                     }
                 }
 
-                self.query(vec, k, ef_search)
+                match &self.storage {
+                    HnswVectorStorage::Float => {
+                        self.query(&self.vectors_flat[start..end], k, ef_search)
+                    }
+                    #[cfg(feature = "quantised")]
+                    HnswVectorStorage::Sq8 { codes, .. } => {
+                        self.query_sq8_codes(&codes[start..end], k, ef_search)
+                    }
+                }
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
 
@@ -1413,7 +1690,7 @@ where
     ///
     /// Distance according to the index's metric
     #[inline(always)]
-    fn compute_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
+    fn compute_float_query_distance(&self, query: &[T], idx: usize, query_norm: T) -> T {
         match self.metric {
             Dist::SquaredEuclidean => self.euclidean_distance_to_query(idx, query),
             Dist::Cosine => self.cosine_distance_to_query(idx, query, query_norm),
@@ -1430,18 +1707,37 @@ where
         self.extend_candidates
     }
 
+    #[cfg(feature = "quantised")]
+    /// Return SQ8 calibration diagnostics, or `None` for a float-backed index.
+    pub fn sq8_stats(&self) -> Option<HnswSq8Stats> {
+        match &self.storage {
+            HnswVectorStorage::Float => None,
+            HnswVectorStorage::Sq8 { stats, .. } => Some(*stats),
+        }
+    }
+
     /// Returns the size of the index in bytes
     ///
     /// ### Returns
     ///
     /// Index size `in n bytes`
     pub fn memory_usage_bytes(&self) -> usize {
+        let storage_bytes = match &self.storage {
+            HnswVectorStorage::Float => 0,
+            #[cfg(feature = "quantised")]
+            HnswVectorStorage::Sq8 { codes, weights, .. } => {
+                codes.capacity() * std::mem::size_of::<i8>()
+                    + weights.capacity() * std::mem::size_of::<f32>()
+            }
+        };
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.layer_assignments.capacity() * std::mem::size_of::<u8>()
             + self.neighbours_flat.capacity() * std::mem::size_of::<u32>()
             + self.neighbour_offsets.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + storage_bytes
     }
 }
 
@@ -1704,5 +2000,50 @@ mod tests {
 
             assert_eq!(indices.len(), 10, "Failed with m = {}", m);
         }
+    }
+
+    #[cfg(feature = "quantised")]
+    #[test]
+    fn sq8_weighted_kernel_matches_scalar_reference() {
+        let a: Vec<i8> = (0..37)
+            .map(|i| ((i * 17) % 251) as i16 - 125)
+            .map(|x| x as i8)
+            .collect();
+        let b: Vec<i8> = (0..37)
+            .map(|i| ((i * 29) % 247) as i16 - 123)
+            .map(|x| x as i8)
+            .collect();
+        let weights: Vec<f32> = (0..37).map(|i| 0.0001 + i as f32 * 0.003).collect();
+
+        let expected = sq8_weighted_l2_scalar(&a, &b, &weights);
+        let actual = sq8_weighted_l2(&a, &b, &weights);
+        assert_relative_eq!(actual, expected, max_relative = 2e-6, epsilon = 1e-3);
+    }
+
+    #[cfg(feature = "quantised")]
+    #[test]
+    fn sq8_hnsw_build_query_and_self_graph_share_traversal() {
+        let n = 64;
+        let dim = 19;
+        let mat = Mat::from_fn(n, dim, |row, col| {
+            row as f32 * (col as f32 + 1.0) + col as f32 * 0.1
+        });
+        let index = HnswIndex::<f32>::build_sq8(mat.as_ref(), 12, 100, 42, false);
+
+        assert!(index.vectors_flat.is_empty());
+        let stats = index.sq8_stats().unwrap();
+        assert_eq!(stats.clipped_values, 0);
+        assert!(stats.endpoint_codes > 0);
+
+        let query: Vec<f32> = mat.row(17).iter().copied().collect();
+        let (indices, distances) = index.query(&query, 5, 100).unwrap();
+        assert_eq!(indices[0], 17);
+        assert_relative_eq!(distances[0], 0.0, epsilon = 1e-6);
+
+        let (self_indices, self_distances) = index.generate_knn(5, 100, true, false).unwrap();
+        let self_distances = self_distances.unwrap();
+        assert_eq!(self_indices.len(), n);
+        assert_eq!(self_indices[17][0], 17);
+        assert_relative_eq!(self_distances[17][0], 0.0, epsilon = 1e-6);
     }
 }
